@@ -141,20 +141,24 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ success: false, error: msg, power_station_found: powerStationParsed.length }, 500);
   }
 
-  // Assign cinema_name and source_reference, split Power Station vs Arches.
-  const allRecords: ScreeningRecord[] = [];
+  // Build per-venue record groups, then commit each venue separately so
+  // that commitImport deactivates stale rows using the correct cinema_name.
   const venueResults: VenueResult[] = [];
+  let totalSaved = 0;
+  const allErrors: string[] = [];
 
-  // Selfridges: all screenings get cinema_name = "The Cinema at Selfridges".
-  {
-    const prefix = "selfridges";
-    const cinemaName = "The Cinema at Selfridges";
-    const upcoming = selfridgesParsed.filter(
-      (p) => p.start_time_iso !== null && new Date(p.start_time_iso).getTime() > nowUtc.getTime()
-    );
-    const skippedPast = selfridgesParsed.length - upcoming.length;
-    const records: ScreeningRecord[] = upcoming
-      .filter((p) => p.start_time_iso !== null)
+  // Helper: build records for a venue from parsed screenings.
+  const buildRecords = (
+    parsed: ParsedOlympicScreening[],
+    cinemaName: string,
+    prefix: string
+  ): ScreeningRecord[] =>
+    parsed
+      .filter(
+        (p) =>
+          p.start_time_iso !== null &&
+          new Date(p.start_time_iso).getTime() > nowUtc.getTime()
+      )
       .map((p) => {
         const sourceRef = p.booking_id
           ? `olympic:${prefix}:${p.booking_id}`
@@ -170,107 +174,100 @@ Deno.serve(async (req: Request) => {
           last_seen_at: new Date().toISOString(),
         };
       });
-    allRecords.push(...records);
+
+  // --- Selfridges ---
+  {
+    const cinemaName = "The Cinema at Selfridges";
+    const prefix = "selfridges";
+    const records = buildRecords(selfridgesParsed, cinemaName, prefix);
+    const skippedPast = selfridgesParsed.length - records.length;
+    const venueCtx: ImportRunContext = { ...ctx, cinemaName };
+    const { saved, errors } = await commitImport(venueCtx, records, nowUtc);
+    totalSaved += saved;
+    allErrors.push(...errors);
     venueResults.push({
       cinema_name: cinemaName,
       prefix,
       found: selfridgesParsed.length,
-      saved: records.length,
+      saved,
       skipped_past: skippedPast,
     });
   }
 
-  // Power Station page: split by venue label.
+  // --- Power Station + Arches (from the same page, split by venue label) ---
   {
     const psPrefix = "power-station";
     const archesPrefix = "arches";
     const psCinemaName = "The Cinema in the Power Station";
     const archesCinemaName = "The Cinema in the Arches";
 
-    const psUpcoming: ParsedOlympicScreening[] = [];
-    const archesUpcoming: ParsedOlympicScreening[] = [];
-    let psTotal = 0;
-    let archesTotal = 0;
-
+    const psParsed: ParsedOlympicScreening[] = [];
+    const archesParsed: ParsedOlympicScreening[] = [];
     for (const p of powerStationParsed) {
-      const isArches = /arches/i.test(p.venue_label);
-      if (isArches) archesTotal++;
-      else psTotal++;
-
-      if (p.start_time_iso === null) continue;
-      if (new Date(p.start_time_iso).getTime() <= nowUtc.getTime()) continue;
-      if (isArches) {
-        archesUpcoming.push(p);
-      } else {
-        psUpcoming.push(p);
-      }
+      if (/arches/i.test(p.venue_label)) archesParsed.push(p);
+      else psParsed.push(p);
     }
 
-    const psRecords: ScreeningRecord[] = psUpcoming.map((p) => {
-      const sourceRef = p.booking_id
-        ? `olympic:${psPrefix}:${p.booking_id}`
-        : fallbackSourceRef(psPrefix, p.movie_title, p.start_time_iso!);
-      return {
+    // Power Station
+    {
+      const records = buildRecords(psParsed, psCinemaName, psPrefix);
+      const skippedPast = psParsed.length - records.length;
+      const venueCtx: ImportRunContext = { ...ctx, cinemaName: psCinemaName };
+      const { saved, errors } = await commitImport(venueCtx, records, nowUtc);
+      totalSaved += saved;
+      allErrors.push(...errors);
+      venueResults.push({
         cinema_name: psCinemaName,
-        movie_title: p.movie_title,
-        start_time: p.start_time_iso!,
-        booking_url: p.booking_url,
-        format: p.status_label,
-        sold_out: p.sold_out,
-        source_reference: sourceRef,
-        last_seen_at: new Date().toISOString(),
-      };
-    });
+        prefix: psPrefix,
+        found: psParsed.length,
+        saved,
+        skipped_past: skippedPast,
+      });
+    }
 
-    const archesRecords: ScreeningRecord[] = archesUpcoming.map((p) => {
-      const sourceRef = p.booking_id
-        ? `olympic:${archesPrefix}:${p.booking_id}`
-        : fallbackSourceRef(archesPrefix, p.movie_title, p.start_time_iso!);
-      return {
+    // Arches (no minimum-count requirement)
+    {
+      const records = buildRecords(archesParsed, archesCinemaName, archesPrefix);
+      const skippedPast = archesParsed.length - records.length;
+      const venueCtx: ImportRunContext = { ...ctx, cinemaName: archesCinemaName };
+      const { saved, errors } = await commitImport(venueCtx, records, nowUtc);
+      totalSaved += saved;
+      allErrors.push(...errors);
+      venueResults.push({
         cinema_name: archesCinemaName,
-        movie_title: p.movie_title,
-        start_time: p.start_time_iso!,
-        booking_url: p.booking_url,
-        format: p.status_label,
-        sold_out: p.sold_out,
-        source_reference: sourceRef,
-        last_seen_at: new Date().toISOString(),
-      };
-    });
-
-    allRecords.push(...psRecords, ...archesRecords);
-
-    venueResults.push({
-      cinema_name: psCinemaName,
-      prefix: psPrefix,
-      found: psTotal,
-      saved: psRecords.length,
-      skipped_past: psTotal - psRecords.length,
-    });
-    venueResults.push({
-      cinema_name: archesCinemaName,
-      prefix: archesPrefix,
-      found: archesTotal,
-      saved: archesRecords.length,
-      skipped_past: archesTotal - archesRecords.length,
-    });
+        prefix: archesPrefix,
+        found: archesParsed.length,
+        saved,
+        skipped_past: skippedPast,
+      });
+    }
   }
 
-  // Commit all records together. commitImport handles upsert + deactivation.
-  const { saved, errors } = await commitImport(ctx, allRecords, nowUtc);
-  if (errors.length > 0) {
-    const msg = `Import errors: ${errors.join("; ")}`;
-    await endRun(ctx, runId, "failed", allRecords.length, saved, msg);
+  if (allErrors.length > 0) {
+    const msg = `Import errors: ${allErrors.join("; ")}`;
+    await endRun(ctx, runId, "failed", totalSaved, totalSaved, msg);
     return jsonResponse(
-      { success: false, error: msg, screenings_found: allRecords.length, screenings_saved: saved },
+      { success: false, error: msg, screenings_saved: totalSaved },
       500
     );
   }
 
-  await endRun(ctx, runId, "success", allRecords.length, saved);
-  console.log(`[import-olympic-cinemas] done: total saved=${saved}`);
+  await endRun(ctx, runId, "success", totalSaved, totalSaved);
+  console.log(`[import-olympic-cinemas] done: total saved=${totalSaved}`);
 
-  // Build per-venue examples.
+  // Collect all saved records for examples (re-query for display).
+  const allRecords: ScreeningRecord[] = [];
+  for (const vr of venueResults) {
+    const { data } = await supabase
+      .from("screenings")
+      .select("cinema_name,movie_title,start_time,booking_url,format,sold_out,source_reference")
+      .eq("cinema_name", vr.cinema_name)
+      .eq("active", true)
+      .order("start_time", { ascending: true })
+      .limit(5);
+    if (data) allRecords.push(...(data as ScreeningRecord[]));
+  }
+
   const examples: Record<string, ScreeningRecord[]> = {};
   for (const vr of venueResults) {
     examples[vr.cinema_name] = allRecords
@@ -286,7 +283,7 @@ Deno.serve(async (req: Request) => {
       screenings_saved: vr.saved,
       skipped_past: vr.skipped_past,
     })),
-    total_screenings_saved: saved,
+    total_screenings_saved: totalSaved,
     import_started_at: startedIso,
     import_completed_at: new Date().toISOString(),
     examples,

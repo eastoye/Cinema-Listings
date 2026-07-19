@@ -100,6 +100,7 @@ export interface ScreeningRecord {
   sold_out: boolean;
   source_reference: string;
   last_seen_at: string;
+  active?: boolean;
 }
 
 export interface ImportRunContext {
@@ -168,7 +169,11 @@ export async function commitImport(
 ): Promise<{ saved: number; errors: string[] }> {
   const { supabase, cinemaName } = ctx;
   const lastSeenAt = new Date().toISOString();
-  for (const r of records) r.last_seen_at = lastSeenAt;
+  for (const r of records) {
+    r.last_seen_at = lastSeenAt;
+    // Ensure reappeared screenings are marked active again.
+    r.active = true;
+  }
 
   let saved = 0;
   const errors: string[] = [];

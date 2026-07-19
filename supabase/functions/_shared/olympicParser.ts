@@ -28,19 +28,28 @@ const MONTHS: Record<string, number> = {
   july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
 };
 
-// Parse a date heading like "Sunday July 19" or "Sunday July 19 2026".
+// Parse a date heading. Supports both orderings, with optional year:
+//   "Sunday July 19"  /  "Sunday July 19 2026"
+//   "Sunday 19 July"  /  "Sunday 19 July 2026"
 function parseDateHeading(
   text: string
 ): { day: number; month: number; year: number | null } | null {
-  const m = text
-    .trim()
-    .match(/^(?:[A-Za-z]+)\s+(\d{1,2})\s+([A-Za-z]+)(?:\s+(\d{4}))?$/);
-  if (!m) return null;
-  const day = parseInt(m[1], 10);
-  const month = MONTHS[m[2].toLowerCase()];
-  if (!month) return null;
-  const year = m[3] ? parseInt(m[3],  10) : null;
-  return { day, month, year };
+  const trimmed = text.trim();
+  // Format A: weekday  month  day  [year]  — "Sunday July 19"
+  let m = trimmed.match(/^(?:[A-Za-z]+)\s+([A-Za-z]+)\s+(\d{1,2})(?:\s+(\d{4}))?$/);
+  if (m) {
+    const month = MONTHS[m[1].toLowerCase()];
+    if (!month) return null;
+    return { day: parseInt(m[2], 10), month, year: m[3] ? parseInt(m[3], 10) : null };
+  }
+  // Format B: weekday  day  month  [year]  — "Sunday 19 July"
+  m = trimmed.match(/^(?:[A-Za-z]+)\s+(\d{1,2})\s+([A-Za-z]+)(?:\s+(\d{4}))?$/);
+  if (m) {
+    const month = MONTHS[m[2].toLowerCase()];
+    if (!month) return null;
+    return { day: parseInt(m[1], 10), month, year: m[3] ? parseInt(m[3], 10) : null };
+  }
+  return null;
 }
 
 // Parse 24h time like "19:30".
@@ -113,30 +122,27 @@ export function parseOlympicPage(
     const year =
       dateParts.year ?? inferYear(dateParts.day, dateParts.month, nowLondon);
 
-    // Find all film link positions to delimit film blocks.
-    const filmLinkRegex = /href="\/film\/([^"]+)"/g;
-    const filmLinks: { slug: string; index: number }[] = [];
+    // Find all film link anchors to delimit film blocks.
+    // Matching the full <a ...>...</a> tag ensures the block starts at the
+    // opening <a, so nested booking buttons are included in the block.
+    const filmLinkRegex =
+      /<a\s+[^>]*href="\/film\/([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+    const filmLinks: { slug: string; index: number; title: string }[] = [];
     let flMatch: RegExpExecArray | null;
     while ((flMatch = filmLinkRegex.exec(sectionBody)) !== null) {
-      filmLinks.push({ slug: flMatch[1], index: flMatch.index });
+      const anchorTitle = decodeEntities(stripTags(flMatch[2])).trim();
+      filmLinks.push({ slug: flMatch[1], index: flMatch.index, title: anchorTitle });
     }
 
     for (let i = 0; i < filmLinks.length; i++) {
-      const { slug } = filmLinks[i];
+      const { slug, title: anchorTitle } = filmLinks[i];
       const blockStart = filmLinks[i].index;
       const blockEnd =
         i + 1 < filmLinks.length ? filmLinks[i + 1].index : sectionBody.length;
       const block = sectionBody.slice(blockStart, blockEnd);
 
-      // Extract title: prefer the text inside the film link anchor,
-      // fall back to img alt, then to slug.
-      let movieTitle: string | null = null;
-      const filmAnchorMatch = block.match(
-        /<a\s+[^>]*href="\/film\/[^"]*"[^>]*>([\s\S]*?)<\/a>/
-      );
-      if (filmAnchorMatch) {
-        movieTitle = decodeEntities(stripTags(filmAnchorMatch[1])).trim();
-      }
+      // Title: prefer the anchor text, fall back to img alt, then slug.
+      let movieTitle: string | null = anchorTitle || null;
       if (!movieTitle) {
         const altMatch = block.match(/<img[^>]*alt="([^"]+)"/);
         if (altMatch && altMatch[1].trim() && !altMatch[1].startsWith("BBFC")) {
@@ -231,7 +237,7 @@ export function parseOlympicPage(
           film_slug: slug,
           film_url: filmUrl,
           status_label: statusLabel ?? formatFromUrl,
-          sold_out,
+          sold_out: soldOut,
         });
       }
     }
