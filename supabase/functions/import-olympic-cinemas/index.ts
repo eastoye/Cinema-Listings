@@ -116,12 +116,22 @@ Deno.serve(async (req: Request) => {
   // Parse both pages.
   let selfridgesParsed: ParsedOlympicScreening[] = [];
   let powerStationParsed: ParsedOlympicScreening[] = [];
+  let powerStationDiagnostics = {
+    venueHeadingsArches: 0,
+    venueHeadingsPowerstation: 0,
+    archesBookingButtons: 0,
+    powerStationBookingButtons: 0,
+  };
   try {
-    selfridgesParsed = parseOlympicPage(selfridgesHtml, SELFRIDGES_BASE, nowLondon);
+    const selfridgesResult = parseOlympicPage(selfridgesHtml, SELFRIDGES_BASE, nowLondon);
+    selfridgesParsed = selfridgesResult.screenings;
     console.log(`[import-olympic-cinemas] Selfridges parsed ${selfridgesParsed.length} screenings`);
 
-    powerStationParsed = parseOlympicPage(powerStationHtml, POWER_STATION_BASE, nowLondon);
+    const powerStationResult = parseOlympicPage(powerStationHtml, POWER_STATION_BASE, nowLondon);
+    powerStationParsed = powerStationResult.screenings;
+    powerStationDiagnostics = powerStationResult.diagnostics;
     console.log(`[import-olympic-cinemas] Power Station parsed ${powerStationParsed.length} screenings`);
+    console.log(`[import-olympic-cinemas] diagnostics: ${JSON.stringify(powerStationDiagnostics)}`);
   } catch (err) {
     const msg = `Parse error: ${err instanceof Error ? err.message : String(err)}`;
     await endRun(ctx, runId, "failed", 0, 0, msg);
@@ -225,8 +235,16 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    // Arches (no minimum-count requirement)
-    {
+    // Arches (no minimum-count requirement).
+    // Only commit if the parser found Arches screenings OR the diagnostics
+    // confirm the page genuinely contains Arches booking buttons. This
+    // prevents deactivating existing Arches rows when the parser returns
+    // zero due to a parse failure rather than a genuine absence.
+    const archesPresentOnPage =
+      archesParsed.length > 0 ||
+      powerStationDiagnostics.archesBookingButtons > 0 ||
+      powerStationDiagnostics.venueHeadingsArches > 0;
+    if (archesPresentOnPage) {
       const records = buildRecords(archesParsed, archesCinemaName, archesPrefix);
       const skippedPast = archesParsed.length - records.length;
       const venueCtx: ImportRunContext = { ...ctx, cinemaName: archesCinemaName };
@@ -239,6 +257,15 @@ Deno.serve(async (req: Request) => {
         found: archesParsed.length,
         saved,
         skipped_past: skippedPast,
+      });
+    } else {
+      console.log("[import-olympic-cinemas] Arches not present on page; skipping commit to preserve existing rows.");
+      venueResults.push({
+        cinema_name: archesCinemaName,
+        prefix: archesPrefix,
+        found: 0,
+        saved: 0,
+        skipped_past: 0,
       });
     }
   }
@@ -283,6 +310,7 @@ Deno.serve(async (req: Request) => {
       screenings_saved: vr.saved,
       skipped_past: vr.skipped_past,
     })),
+    diagnostics: powerStationDiagnostics,
     total_screenings_saved: totalSaved,
     import_started_at: startedIso,
     import_completed_at: new Date().toISOString(),

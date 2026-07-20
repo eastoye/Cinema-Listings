@@ -21,6 +21,18 @@ export interface ParsedOlympicScreening {
   parse_error?: string;
 }
 
+export interface OlympicDiagnostics {
+  venueHeadingsArches: number;
+  venueHeadingsPowerstation: number;
+  archesBookingButtons: number;
+  powerStationBookingButtons: number;
+}
+
+export interface OlympicParseResult {
+  screenings: ParsedOlympicScreening[];
+  diagnostics: OlympicDiagnostics;
+}
+
 const MONTHS: Record<string, number> = {
   jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
   jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
@@ -28,22 +40,24 @@ const MONTHS: Record<string, number> = {
   july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
 };
 
-// Parse a date heading. Supports both orderings, with optional year:
+// Parse a date heading. Supports both orderings, with optional year and commas:
 //   "Sunday July 19"  /  "Sunday July 19 2026"
 //   "Sunday 19 July"  /  "Sunday 19 July 2026"
+//   "Sunday, July 19" /  "Sunday, 19 July 2026"
 function parseDateHeading(
   text: string
 ): { day: number; month: number; year: number | null } | null {
-  const trimmed = text.trim();
+  // Normalise: collapse whitespace, remove commas.
+  const trimmed = text.trim().replace(/,/g, "").replace(/\s+/g, " ").trim();
   // Format A: weekday  month  day  [year]  — "Sunday July 19"
-  let m = trimmed.match(/^(?:[A-Za-z]+)\s+([A-Za-z]+)\s+(\d{1,2})(?:\s+(\d{4}))?$/);
+  let m = trimmed.match(/^[A-Za-z]+\s+([A-Za-z]+)\s+(\d{1,2})(?:\s+(\d{4}))?$/);
   if (m) {
     const month = MONTHS[m[1].toLowerCase()];
     if (!month) return null;
     return { day: parseInt(m[2], 10), month, year: m[3] ? parseInt(m[3], 10) : null };
   }
   // Format B: weekday  day  month  [year]  — "Sunday 19 July"
-  m = trimmed.match(/^(?:[A-Za-z]+)\s+(\d{1,2})\s+([A-Za-z]+)(?:\s+(\d{4}))?$/);
+  m = trimmed.match(/^[A-Za-z]+\s+(\d{1,2})\s+([A-Za-z]+)(?:\s+(\d{4}))?$/);
   if (m) {
     const month = MONTHS[m[2].toLowerCase()];
     if (!month) return null;
@@ -86,18 +100,38 @@ function extractFormatFromUrl(url: string): string | null {
   return suffix;
 }
 
+// Detect venue from a booking-button class attribute.
+// Returns "arches", "power-station", or null.
+function venueFromClass(classAttr: string): string | null {
+  if (/arches/i.test(classAttr)) return "arches";
+  if (/power(?:station)?/i.test(classAttr)) return "power-station";
+  return null;
+}
+
+// Detect venue from an h6 heading text.
+// Returns "arches", "power-station", or null.
+function venueFromHeading(text: string): string | null {
+  if (/arches/i.test(text)) return "arches";
+  if (/power\s*station/i.test(text)) return "power-station";
+  return null;
+}
+
 // Parse a single Olympic/mycloudcinema whats-on page.
-// Returns raw screenings with venue_label set; the caller assigns cinema_name
-// and source_reference based on the page source and venue label.
+// Returns raw screenings with venue_label set plus diagnostic counts.
 export function parseOlympicPage(
   html: string,
   baseUrl: string,
   nowLondon: Date
-): ParsedOlympicScreening[] {
+): OlympicParseResult {
   const results: ParsedOlympicScreening[] = [];
+  const diagnostics: OlympicDiagnostics = {
+    venueHeadingsArches: 0,
+    venueHeadingsPowerstation: 0,
+    archesBookingButtons: 0,
+    powerStationBookingButtons: 0,
+  };
 
-  // Split by date sections. Extract the h3 date heading and everything
-  // until the next date-section or end of the container.
+  // Split by date sections.
   const sectionRegex = /<section class="date-section">/g;
   const sectionStarts: number[] = [];
   let sm: RegExpExecArray | null;
@@ -158,20 +192,69 @@ export function parseOlympicPage(
 
       const filmUrl = `${baseUrl}/film/${slug}`;
 
-      // Extract h6 venue label.
-      const h6Match = block.match(/<h6[^>]*>([^<]+)<\/h6>/);
-      const venueLabel = h6Match ? h6Match[1].trim() : "";
-
-      // Find booking button anchors directly by their class pattern.
-      // These are <a class="btn btn-{venue} ..." href="...mycloudcinema.../book/{id}">
-      // containing <span class="btn-times-fs">time</span>.
-      // The href and class attributes can appear in any order.
+      // --- Venue tracking in document order ---
+      // Find all h6 venue headings and booking button anchors in document
+      // order, then walk through them tracking the current venue.
+      const h6Regex = /<h6[^>]*>([^<]+)<\/h6>/g;
       const btnAnchorRegex =
         /<a\s+[^>]*class="[^"]*btn\s+btn-[^"]*"[^>]*>([\s\S]*?)<\/a>/g;
-      let btnMatch: RegExpExecArray | null;
-      while ((btnMatch = btnAnchorRegex.exec(block)) !== null) {
-        const fullAnchor = btnMatch[0];
-        const innerContent = btnMatch[1];
+
+      const events: {
+        type: "heading" | "button";
+        index: number;
+        text?: string;
+        fullAnchor?: string;
+        innerContent?: string;
+      }[] = [];
+
+      let h6m: RegExpExecArray | null;
+      while ((h6m = h6Regex.exec(block)) !== null) {
+        events.push({ type: "heading", index: h6m.index, text: h6m[1].trim() });
+      }
+      let btnm: RegExpExecArray | null;
+      while ((btnm = btnAnchorRegex.exec(block)) !== null) {
+        events.push({
+          type: "button",
+          index: btnm.index,
+          fullAnchor: btnm[0],
+          innerContent: btnm[1],
+        });
+      }
+      events.sort((a, b) => a.index - b.index);
+
+      let currentVenueLabel = "";
+      let currentVenueKey: string | null = null;
+
+      for (const ev of events) {
+        if (ev.type === "heading") {
+          currentVenueLabel = ev.text || "";
+          const key = ev.text ? venueFromHeading(ev.text) : null;
+          if (key === "arches") diagnostics.venueHeadingsArches++;
+          else if (key === "power-station") diagnostics.venueHeadingsPowerstation++;
+          currentVenueKey = key;
+          continue;
+        }
+
+        // It's a booking button.
+        const fullAnchor = ev.fullAnchor!;
+        const innerContent = ev.innerContent!;
+
+        // Determine venue for this button: heading takes precedence, then
+        // fall back to the button's own class.
+        let venueLabel = currentVenueLabel;
+        let venueKey = currentVenueKey;
+        const classMatch = fullAnchor.match(/class="([^"]*)"/);
+        const classAttr = classMatch ? classMatch[1] : "";
+        const classKey = venueFromClass(classAttr);
+        if (classKey === "arches") diagnostics.archesBookingButtons++;
+        else if (classKey === "power-station") diagnostics.powerStationBookingButtons++;
+        if (!venueKey && classKey) {
+          venueKey = classKey;
+          venueLabel =
+            classKey === "arches"
+              ? "The Cinema in the Arches"
+              : "The Cinema in the Power Station";
+        }
 
         // Extract href from the anchor.
         const hrefMatch = fullAnchor.match(/href="([^"]*)"/);
@@ -212,8 +295,8 @@ export function parseOlympicPage(
 
         // Check for sold-out indicators.
         const soldOut =
-          /sold[- ]?out/i.test(btnMatch[0]) ||
-          /class="[^"]*(?:inactive|disabled)[^"]*"/.test(btnMatch[0]);
+          /sold[- ]?out/i.test(fullAnchor) ||
+          /class="[^"]*(?:inactive|disabled)[^"]*"/.test(fullAnchor);
 
         // Format from URL suffix.
         const formatFromUrl = bookingUrl
@@ -243,7 +326,7 @@ export function parseOlympicPage(
     }
   }
 
-  return results;
+  return { screenings: results, diagnostics };
 }
 
 // Build a stable source_reference for a screening without a booking ID.
