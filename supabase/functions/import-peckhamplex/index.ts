@@ -116,17 +116,18 @@ function parseByDay(html: string, nowLondon: Date, labelPerfIds: Map<string, str
       if (!rawTitle) continue;
       const movieTitle = decodeEntities(rawTitle);
 
-      const timeRegex = /<a class="btn btn-info"[^>]*href="https:\/\/ticketing\.eu\.veezi\.com\/purchase\/(\d+)[^"]*"[^>]*>([^<]+)<\/a>/g;
+      const timeRegex = /<a class="btn btn-info"[^>]*href="(https:\/\/ticketing\.eu\.veezi\.com\/purchase\/(\d+)[^"]*)"[^>]*>([^<]+)<\/a>/g;
       let timeMatch: RegExpExecArray | null;
       while ((timeMatch = timeRegex.exec(timesBody)) !== null) {
-        const perfId = timeMatch[1];
-        const timeText = timeMatch[2].trim();
+        const bookingUrl = timeMatch[1];
+        const perfId = timeMatch[2];
+        const timeText = timeMatch[3].trim();
         const timeParts = parse24hTime(timeText);
         if (!timeParts) {
           results.push({
             movie_title: movieTitle,
             start_time_iso: null,
-            booking_url: `https://ticketing.eu.veezi.com/purchase/${perfId}`,
+            booking_url: bookingUrl,
             performance_id: perfId,
             format: labelPerfIds.get(perfId) || null,
             sold_out: false,
@@ -139,7 +140,7 @@ function parseByDay(html: string, nowLondon: Date, labelPerfIds: Map<string, str
         results.push({
           movie_title: movieTitle,
           start_time_iso: utc.toISOString(),
-          booking_url: `https://ticketing.eu.veezi.com/purchase/${perfId}`,
+          booking_url: bookingUrl,
           performance_id: perfId,
           format: labelPerfIds.get(perfId) || null,
           sold_out: false,
