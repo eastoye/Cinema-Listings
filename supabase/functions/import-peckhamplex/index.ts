@@ -88,7 +88,7 @@ function normaliseTitle(title: string): string {
 function parseByDay(html: string, nowLondon: Date, labelPerfIds: Map<string, string>): ParsedScreening[] {
   const results: ParsedScreening[] = [];
 
-  const dayRegex = /<h3>([^<]+)<\/h3>\s*<div class="film-day-wrapper">([\s\S]*?)(?=<h3>|<\/div>\s*<\/div>\s*<!--|$)/g;
+  const dayRegex = /<h3>([^<]+)<\/h3>([\s\S]*?)(?=<h3>|$)/g;
   let dayMatch: RegExpExecArray | null;
   while ((dayMatch = dayRegex.exec(html)) !== null) {
     const dateText = dayMatch[1].trim();
@@ -108,11 +108,11 @@ function parseByDay(html: string, nowLondon: Date, labelPerfIds: Map<string, str
       continue;
     }
 
-    const filmRegex = /<div class="title">([\s\S]*?)<\/div>\s*<div class="times">([\s\S]*?)<\/div>/g;
+    const filmRegex = /<div class="title">([^<]+)<\/div>([\s\S]*?)<div class="times">([\s\S]*?)<\/div>/g;
     let filmMatch: RegExpExecArray | null;
     while ((filmMatch = filmRegex.exec(filmsBody)) !== null) {
       const rawTitle = stripTags(filmMatch[1]).trim();
-      const timesBody = filmMatch[2];
+      const timesBody = filmMatch[3];
       if (!rawTitle) continue;
       const movieTitle = decodeEntities(rawTitle);
 

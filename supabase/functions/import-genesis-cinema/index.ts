@@ -109,10 +109,17 @@ function parseGenesis(html: string, nowLondon: Date): ParsedScreening[] {
     const movieTitle = cleanTitle || rawTitle;
     const formatLabel = labels.length > 0 ? labels.join(", ") : null;
 
+    // The page renders showtimes twice: once in a desktop block
+    // (<div class="hidden md:block">) and once in a mobile block
+    // (<div class="block md:hidden">). Parse only the desktop block to
+    // avoid duplicate source_references.
+    const desktopMatch = body.match(/<div class="hidden md:block">([\s\S]*?)<\/div>\s*<\/div>\s*<div class="col-span-10 block md:hidden">/);
+    const desktopBody = desktopMatch ? desktopMatch[1] : body;
+
     // Each date block: <div>{Date text}<div class="grid ...">...</div></div>
     const dateBlockRegex = /<div>((?:Mon|Tues?|Wednes?|Thurs?|Fri|Satur?|Sun)day\s+\d{1,2}\s+[A-Za-z]+\s+\d{4})<div[^>]*>([\s\S]*?)<\/div><\/div>/g;
     let dateMatch: RegExpExecArray | null;
-    while ((dateMatch = dateBlockRegex.exec(body)) !== null) {
+    while ((dateMatch = dateBlockRegex.exec(desktopBody)) !== null) {
       const dateText = dateMatch[1];
       const timesBody = dateMatch[2];
 
