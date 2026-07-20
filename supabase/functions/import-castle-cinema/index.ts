@@ -69,10 +69,11 @@ function parseCastle(html: string): ParsedScreening[] {
       const startTimeRaw = perfMatch[2];
       const perfBody = perfMatch[3];
 
-      // Sold out: class contains "is-sold-out" or "off-sale", or sold-out span is visible.
-      const soldOut =
-        /is-sold-out|off-sale/.test(perfMatch[0]) ||
-        /<span class="sold-out"[^>]*>sold out<\/span>/i.test(perfBody);
+      // Sold out: the anchor gets an "is-sold-out" (or "off-sale") class and the
+      // sold-out span loses its display:none style. The span itself is always
+      // present in the markup, so checking the span alone would mark everything
+      // sold out — rely on the anchor class instead.
+      const soldOut = /is-sold-out|off-sale/.test(perfMatch[0]);
 
       // Screening type / format.
       const stMatch = perfBody.match(
