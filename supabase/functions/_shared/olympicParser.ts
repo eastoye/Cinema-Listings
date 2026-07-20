@@ -256,9 +256,15 @@ export function parseOlympicPage(
               : "The Cinema in the Power Station";
         }
 
-        // Extract href from the anchor.
+        // Extract href from the anchor. Arches buttons use href="#" with the
+        // real booking URL in a data-booking-url attribute; Power Station
+        // buttons put the real URL directly in href.
         const hrefMatch = fullAnchor.match(/href="([^"]*)"/);
-        const rawHref = hrefMatch ? hrefMatch[1] : null;
+        let rawHref = hrefMatch ? hrefMatch[1] : null;
+        if (!rawHref || rawHref === "#") {
+          const dataMatch = fullAnchor.match(/data-booking-url="([^"]*)"/);
+          if (dataMatch) rawHref = dataMatch[1];
+        }
 
         // Extract time.
         const timeMatch = innerContent.match(
