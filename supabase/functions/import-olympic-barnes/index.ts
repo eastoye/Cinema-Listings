@@ -22,36 +22,48 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2.45.4";
 import {
+  commitImport,
   corsHeaders,
+  endRun,
   jsonResponse,
   londonOffsetMinutes,
   startRun,
-  endRun,
-  commitImport,
-  type ScreeningRecord,
   type ImportRunContext,
+  type ScreeningRecord,
 } from "../_shared/importSafety.ts";
-import {
-  parseOlympicPage,
-  fallbackSourceRef,
-  type ParsedOlympicScreening,
-} from "../_shared/olympicParser.ts";
+import { parseOlympicPage } from "../_shared/olympicParser.ts";
 
-const WHATSON_URL = "https://www.olympiccinema.com/whats-on";
-const SITE_BASE = "https://www.olympiccinema.com";
+const PROGRAMME_URL = "https://www.olympiccinema.com/whats-on";
+const BASE_URL = "https://www.olympiccinema.com";
 const CINEMA_NAME = "Olympic Cinema Barnes";
-const PREFIX = "barnes";
+const SOURCE_PREFIX = "olympic:barnes";
 const MIN_SCREENINGS = 3;
+const RATIO_GUARD_MIN_EXISTING = 10;
+const MIN_EXPECTED_RATIO = 0.5;
 
-const fetchOpts: RequestInit = {
+const fetchOptions: RequestInit = {
   headers: {
     "User-Agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
     Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9",
   },
-  redirect: "follow" as const,
+  redirect: "follow",
 };
+
+async function getPreviousActiveCount(
+  ctx: ImportRunContext,
+  nowUtc: Date
+): Promise<number> {
+  const { count, error } = await ctx.supabase
+    .from("screenings")
+    .select("id", { count: "exact", head: true })
+    .eq("cinema_name", CINEMA_NAME)
+    .eq("active", true)
+    .gt("start_time", nowUtc.toISOString());
+  if (error) throw new Error(`Could not read previous screening count: ${error.message}`);
+  return count ?? 0;
+}
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
@@ -59,9 +71,6 @@ Deno.serve(async (req: Request) => {
   }
 
   const startedAt = new Date();
-  const startedIso = startedAt.toISOString();
-  console.log(`[import-olympic-barnes] starting at ${startedIso}`);
-
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
   const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
   if (!supabaseUrl || !serviceRoleKey) {
@@ -71,135 +80,103 @@ Deno.serve(async (req: Request) => {
   const supabase = createClient(supabaseUrl, serviceRoleKey, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
-
   const ctx: ImportRunContext = {
     supabase,
     cinemaName: CINEMA_NAME,
     minScreenings: MIN_SCREENINGS,
     startedAt,
   };
-
   const runStart = await startRun(ctx);
   if (runStart.blocked) {
-    return jsonResponse(
-      { success: false, error: "Another import is already running for Olympic Cinema Barnes.", blocked: true },
-      409
-    );
+    return jsonResponse({ success: false, blocked: true, error: "Import already running." }, 409);
   }
   if (runStart.error || !runStart.runId) {
     return jsonResponse({ success: false, error: runStart.error ?? "Could not start run." }, 500);
   }
   const runId = runStart.runId;
 
-  const nowUtc = new Date();
-  const offsetMin = londonOffsetMinutes(nowUtc);
-  const nowLondon = new Date(nowUtc.getTime() + offsetMin * 60 * 1000);
-
-  let html: string;
   try {
-    const resp = await fetch(WHATSON_URL, fetchOpts);
-    if (!resp.ok) {
-      const msg = `Failed to fetch Barnes programme: HTTP ${resp.status} ${resp.statusText}`;
-      await endRun(ctx, runId, "failed", 0, 0, msg);
-      return jsonResponse({ success: false, error: msg }, 502);
+    const response = await fetch(PROGRAMME_URL, fetchOptions);
+    if (!response.ok) throw new Error(`Programme fetch returned HTTP ${response.status}`);
+    const html = await response.text();
+    if (html.length < 10_000) throw new Error(`Programme response was too small (${html.length} bytes)`);
+
+    const nowUtc = new Date();
+    const londonOffset = londonOffsetMinutes(nowUtc);
+    const nowLondon = new Date(nowUtc.getTime() + londonOffset * 60_000);
+    const parsed = parseOlympicPage(html, BASE_URL, nowLondon);
+    const parseErrors = parsed.screenings
+      .filter((screening) => screening.parse_error)
+      .map((screening) => screening.parse_error as string);
+    if (parseErrors.length > 0) {
+      throw new Error(`Programme parse was incomplete: ${parseErrors.slice(0, 5).join("; ")}`);
     }
-    html = await resp.text();
-    console.log(`[import-olympic-barnes] fetched ${html.length} bytes`);
-  } catch (err) {
-    const msg = `Network error: ${err instanceof Error ? err.message : String(err)}`;
-    await endRun(ctx, runId, "failed", 0, 0, msg);
-    return jsonResponse({ success: false, error: msg }, 502);
-  }
 
-  let parsed: ParsedOlympicScreening[] = [];
-  let parseErrors: string[] = [];
-  try {
-    const result = parseOlympicPage(html, SITE_BASE, nowLondon);
-    parsed = result.screenings;
-    parseErrors = parsed
-      .filter((p) => p.parse_error)
-      .map((p) => p.parse_error as string);
-    console.log(
-      `[import-olympic-barnes] parsed ${parsed.length} screenings, ${parseErrors.length} errors`
-    );
-  } catch (err) {
-    const msg = `Parse error: ${err instanceof Error ? err.message : String(err)}`;
-    await endRun(ctx, runId, "failed", 0, 0, msg);
-    return jsonResponse({ success: false, error: msg }, 500);
-  }
-
-  if (parsed.length < MIN_SCREENINGS) {
-    const msg = `Unusually low screening count (${parsed.length}). Database left untouched.`;
-    await endRun(ctx, runId, "failed", parsed.length, 0, msg);
-    return jsonResponse({ success: false, error: msg, screenings_found: parsed.length }, 500);
-  }
-
-  const upcoming = parsed.filter(
-    (p) =>
-      p.start_time_iso !== null &&
-      new Date(p.start_time_iso).getTime() > nowUtc.getTime()
-  );
-  const skippedPast = parsed.length - upcoming.length;
-  console.log(
-    `[import-olympic-barnes] ${upcoming.length} upcoming, ${skippedPast} past skipped`
-  );
-
-  // Deduplicate by source_reference before commit.
-  const seen = new Set<string>();
-  const records: ScreeningRecord[] = upcoming
-    .filter((p) => p.start_time_iso !== null)
-    .map((p) => {
-      const sourceRef = p.booking_id
-        ? `olympic:${PREFIX}:${p.booking_id}`
-        : fallbackSourceRef(PREFIX, p.movie_title, p.start_time_iso!);
-      return {
+    let ignoredWithoutPerformanceId = 0;
+    const records: ScreeningRecord[] = [];
+    for (const screening of parsed.screenings) {
+      if (
+        !screening.start_time_iso ||
+        new Date(screening.start_time_iso).getTime() <= nowUtc.getTime()
+      ) {
+        continue;
+      }
+      if (!screening.booking_id || !screening.booking_url) {
+        ignoredWithoutPerformanceId++;
+        continue;
+      }
+      records.push({
         cinema_name: CINEMA_NAME,
-        movie_title: p.movie_title,
-        start_time: p.start_time_iso!,
-        booking_url: p.booking_url,
-        format: p.status_label,
-        sold_out: p.sold_out,
-        source_reference: sourceRef,
-        last_seen_at: new Date().toISOString(),
-      };
-    })
-    .filter((r) => {
-      if (seen.has(r.source_reference)) return false;
-      seen.add(r.source_reference);
-      return true;
+        movie_title: screening.movie_title,
+        start_time: screening.start_time_iso,
+        booking_url: screening.booking_url,
+        format: screening.status_label,
+        sold_out:
+          screening.sold_out && /sold[ -]?out/i.test(screening.status_label ?? ""),
+        source_reference: `${SOURCE_PREFIX}:${screening.booking_id}`,
+        last_seen_at: nowUtc.toISOString(),
+      });
+    }
+
+    const sourceRefs = new Set(records.map((record) => record.source_reference));
+    if (sourceRefs.size !== records.length) {
+      throw new Error("Duplicate performance IDs were returned; database left untouched.");
+    }
+    if (records.length < MIN_SCREENINGS) {
+      throw new Error(`Unusually low screening count (${records.length}); database left untouched.`);
+    }
+
+    const previousActive = await getPreviousActiveCount(ctx, nowUtc);
+    const ratioFloor = Math.ceil(previousActive * MIN_EXPECTED_RATIO);
+    if (
+      previousActive >= RATIO_GUARD_MIN_EXISTING &&
+      records.length < ratioFloor
+    ) {
+      throw new Error(
+        `Suspicious count drop from ${previousActive} to ${records.length}; database left untouched.`
+      );
+    }
+
+    const { saved, errors } = await commitImport(ctx, records, nowUtc);
+    if (errors.length > 0) throw new Error(`Import errors: ${errors.join("; ")}`);
+
+    await endRun(ctx, runId, "success", records.length, saved);
+    return jsonResponse({
+      success: true,
+      cinema: CINEMA_NAME,
+      screenings_found: records.length,
+      screenings_saved: saved,
+      parser_results: parsed.screenings.length,
+      ignored_without_performance_id: ignoredWithoutPerformanceId,
+      previous_active: previousActive,
+      import_started_at: startedAt.toISOString(),
+      import_completed_at: new Date().toISOString(),
+      examples: records.slice(0, 5),
     });
-
-  const { saved, errors } = await commitImport(ctx, records, nowUtc);
-  if (errors.length > 0) {
-    const msg = `Import errors: ${errors.join("; ")}`;
-    await endRun(ctx, runId, "failed", parsed.length, saved, msg);
-    return jsonResponse(
-      { success: false, error: msg, screenings_found: parsed.length, screenings_saved: saved },
-      500
-    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await endRun(ctx, runId, "failed", 0, 0, message);
+    return jsonResponse({ success: false, error: message }, 500);
   }
-
-  await endRun(ctx, runId, "success", parsed.length, saved);
-  console.log(`[import-olympic-barnes] done: found=${parsed.length} saved=${saved}`);
-
-  return jsonResponse({
-    success: true,
-    cinema: CINEMA_NAME,
-    screenings_found: parsed.length,
-    screenings_saved: saved,
-    skipped_past: skippedPast,
-    parse_errors: parseErrors.slice(0, 10),
-    import_started_at: startedIso,
-    import_completed_at: new Date().toISOString(),
-    examples: upcoming.slice(0, 5).map((p) => ({
-      movie_title: p.movie_title,
-      start_time: p.start_time_iso,
-      source_reference: p.booking_id
-        ? `olympic:${PREFIX}:${p.booking_id}`
-        : fallbackSourceRef(PREFIX, p.movie_title, p.start_time_iso!),
-      booking_url: p.booking_url,
-      format: p.status_label,
-      sold_out: p.sold_out,
-    })),
-  });
 });
+

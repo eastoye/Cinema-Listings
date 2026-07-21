@@ -24,22 +24,31 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2.45.4";
 import {
+  commitImport,
   corsHeaders,
+  endRun,
   jsonResponse,
   startRun,
-  endRun,
-  commitImport,
-  type ScreeningRecord,
   type ImportRunContext,
+  type ScreeningRecord,
 } from "../_shared/importSafety.ts";
 import {
-  fetchAllScreenings,
+  extractFormat,
+  extractLabels,
+  fetchEvents,
+  fetchInstances,
+  parseStartTime,
   type SpektrixConfig,
   type SpektrixEvent,
+  type SpektrixInstance,
 } from "../_shared/spektrixParser.ts";
 
 const CINEMA_NAME = "JW3 Cinema";
 const MIN_SCREENINGS = 3;
+const RATIO_GUARD_MIN_EXISTING = 10;
+const MIN_EXPECTED_RATIO = 0.5;
+const EVENT_END_BUFFER_MS = 2 * 60 * 60 * 1000;
+const FETCH_BATCH_SIZE = 5;
 
 const config: SpektrixConfig = {
   client: "jw3",
@@ -47,14 +56,52 @@ const config: SpektrixConfig = {
   sourcePrefix: "jw3",
 };
 
-// JW3 classifies cinema events via attribute_Genre == "Cinema".
-// This excludes classes, talks-without-film, workshops, children's
-// activities, music, food events, religious events, memberships and
-// donations, which carry other Genre values (Languages, Talks & Discussions,
-// Classes & Courses, Families & Youth, Music, Special Events, etc.).
 function isCinemaEvent(event: SpektrixEvent): boolean {
-  const genre = (event.attributes.attribute_Genre as string) || "";
-  return /^cinema$/i.test(genre.trim());
+  return String(event.attributes.attribute_Genre ?? "").trim().toLowerCase() === "cinema";
+}
+
+function mayHaveUpcomingInstances(event: SpektrixEvent, nowUtc: Date): boolean {
+  const raw = String(event.lastInstanceDateTime ?? "").trim();
+  if (!raw) return true;
+  const withZone = /(?:Z|[+-]\d{2}:?\d{2})$/.test(raw) ? raw : `${raw}Z`;
+  const end = new Date(withZone);
+  if (Number.isNaN(end.getTime())) return true;
+  return end.getTime() >= nowUtc.getTime() - EVENT_END_BUFFER_MS;
+}
+
+async function fetchCandidateInstances(
+  events: SpektrixEvent[]
+): Promise<Array<{ event: SpektrixEvent; instance: SpektrixInstance }>> {
+  const pairs: Array<{ event: SpektrixEvent; instance: SpektrixInstance }> = [];
+  for (let i = 0; i < events.length; i += FETCH_BATCH_SIZE) {
+    const batch = events.slice(i, i + FETCH_BATCH_SIZE);
+    const results = await Promise.all(
+      batch.map(async (event) => ({
+        event,
+        instances: await fetchInstances(config, event.id),
+      }))
+    );
+    for (const result of results) {
+      for (const instance of result.instances) {
+        pairs.push({ event: result.event, instance });
+      }
+    }
+  }
+  return pairs;
+}
+
+async function getPreviousActiveCount(
+  ctx: ImportRunContext,
+  nowUtc: Date
+): Promise<number> {
+  const { count, error } = await ctx.supabase
+    .from("screenings")
+    .select("id", { count: "exact", head: true })
+    .eq("cinema_name", CINEMA_NAME)
+    .eq("active", true)
+    .gt("start_time", nowUtc.toISOString());
+  if (error) throw new Error(`Could not read previous screening count: ${error.message}`);
+  return count ?? 0;
 }
 
 Deno.serve(async (req: Request) => {
@@ -63,9 +110,6 @@ Deno.serve(async (req: Request) => {
   }
 
   const startedAt = new Date();
-  const startedIso = startedAt.toISOString();
-  console.log(`[import-jw3-cinema] starting at ${startedIso}`);
-
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
   const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
   if (!supabaseUrl || !serviceRoleKey) {
@@ -75,20 +119,15 @@ Deno.serve(async (req: Request) => {
   const supabase = createClient(supabaseUrl, serviceRoleKey, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
-
   const ctx: ImportRunContext = {
     supabase,
     cinemaName: CINEMA_NAME,
     minScreenings: MIN_SCREENINGS,
     startedAt,
   };
-
   const runStart = await startRun(ctx);
   if (runStart.blocked) {
-    return jsonResponse(
-      { success: false, error: "Another import is already running for JW3 Cinema.", blocked: true },
-      409
-    );
+    return jsonResponse({ success: false, blocked: true, error: "Import already running." }, 409);
   }
   if (runStart.error || !runStart.runId) {
     return jsonResponse({ success: false, error: runStart.error ?? "Could not start run." }, 500);
@@ -97,104 +136,86 @@ Deno.serve(async (req: Request) => {
 
   try {
     const nowUtc = new Date();
-    const result = await fetchAllScreenings(config, isCinemaEvent, {
-      fromDate: nowUtc,
-    });
-
-    console.log(
-      `[import-jw3-cinema] events=${result.eventsCount} cinemaEvents=${result.cinemaEventsCount} instances=${result.instancesFetched} screenings=${result.screenings.length}`
-    );
-
-    // Abort before any DB write when a meaningful portion of event requests
-    // failed, to avoid incomplete coverage triggering stale cleanup.
-    const failedRatio =
-      result.cinemaEventsCount > 0
-        ? result.errors.length / result.cinemaEventsCount
-        : 0;
-    if (result.errors.length > 0 && failedRatio > 0.25) {
-      const msg = `Too many event fetch errors (${result.errors.length}/${result.cinemaEventsCount}). Database left untouched.`;
-      await endRun(ctx, runId, "failed", result.screenings.length, 0, msg);
-      return jsonResponse(
-        {
-          success: false,
-          error: msg,
-          screenings_found: result.screenings.length,
-          fetch_errors: result.errors.slice(0, 10),
-        },
-        500
-      );
+    const allEvents = await fetchEvents(config);
+    const cinemaEvents = allEvents.filter(isCinemaEvent);
+    const candidates = cinemaEvents.filter((event) => mayHaveUpcomingInstances(event, nowUtc));
+    if (candidates.length === 0) {
+      throw new Error("Spektrix returned no upcoming cinema events; database left untouched.");
     }
 
-    if (result.screenings.length < MIN_SCREENINGS) {
-      const msg = `Unusually low screening count (${result.screenings.length}). Database left untouched.`;
-      await endRun(ctx, runId, "failed", result.screenings.length, 0, msg);
-      return jsonResponse(
-        { success: false, error: msg, screenings_found: result.screenings.length },
-        500
-      );
-    }
+    const pairs = await fetchCandidateInstances(candidates);
+    const records: ScreeningRecord[] = [];
+    const parseErrors: string[] = [];
 
-    // Deduplicate by source_reference before commit, and force sold_out = false.
-    // JW3's isOnSale flag does not reliably indicate sold-out status.
-    const seen = new Set<string>();
-    const records: ScreeningRecord[] = result.screenings
-      .filter((s) => {
-        if (seen.has(s.source_reference)) return false;
-        seen.add(s.source_reference);
-        return true;
-      })
-      .map((s) => ({
+    for (const { event, instance } of pairs) {
+      if (instance.cancelled) continue;
+      const startTime = parseStartTime(instance);
+      if (!instance.id || !startTime) {
+        parseErrors.push(`Invalid instance for event ${event.id}`);
+        continue;
+      }
+      if (new Date(startTime).getTime() <= nowUtc.getTime()) continue;
+
+      const labels = extractLabels(instance, event);
+      const explicitFormat = extractFormat(instance, event, labels);
+      records.push({
         cinema_name: CINEMA_NAME,
-        movie_title: s.movie_title,
-        start_time: s.start_time_iso,
-        booking_url: s.booking_url,
-        format: s.format || (s.labels.length > 0 ? s.labels.join(", ") : null),
+        movie_title: event.name.trim(),
+        start_time: startTime,
+        booking_url: `https://www.jw3.org.uk/spektrix/ChooseSeats?EventInstanceId=${encodeURIComponent(instance.id)}`,
+        format: explicitFormat ?? (labels.length > 0 ? labels.join(", ") : null),
+        // Spektrix isOnSale=false can mean off-sale or not-yet-on-sale.
+        // The API does not explicitly confirm sold out, so keep this false.
         sold_out: false,
-        source_reference: s.source_reference,
-        last_seen_at: new Date().toISOString(),
-      }));
+        source_reference: `jw3:spektrix:${instance.id}`,
+        last_seen_at: nowUtc.toISOString(),
+      });
+    }
+
+    if (parseErrors.length > 0) {
+      throw new Error(`Spektrix parse was incomplete: ${parseErrors.slice(0, 5).join("; ")}`);
+    }
+    const sourceRefs = new Set(records.map((record) => record.source_reference));
+    if (sourceRefs.size !== records.length) {
+      throw new Error("Duplicate performance IDs were returned; database left untouched.");
+    }
+    if (records.length < MIN_SCREENINGS) {
+      throw new Error(`Unusually low screening count (${records.length}); database left untouched.`);
+    }
+
+    const previousActive = await getPreviousActiveCount(ctx, nowUtc);
+    const ratioFloor = Math.ceil(previousActive * MIN_EXPECTED_RATIO);
+    if (
+      previousActive >= RATIO_GUARD_MIN_EXISTING &&
+      records.length < ratioFloor
+    ) {
+      throw new Error(
+        `Suspicious count drop from ${previousActive} to ${records.length}; database left untouched.`
+      );
+    }
 
     const { saved, errors } = await commitImport(ctx, records, nowUtc);
-    if (errors.length > 0) {
-      const msg = `Import errors: ${errors.join("; ")}`;
-      await endRun(ctx, runId, "failed", result.screenings.length, saved, msg);
-      return jsonResponse(
-        {
-          success: false,
-          error: msg,
-          screenings_found: result.screenings.length,
-          screenings_saved: saved,
-        },
-        500
-      );
-    }
+    if (errors.length > 0) throw new Error(`Import errors: ${errors.join("; ")}`);
 
-    await endRun(ctx, runId, "success", result.screenings.length, saved);
-    console.log(`[import-jw3-cinema] done: found=${result.screenings.length} saved=${saved}`);
-
+    await endRun(ctx, runId, "success", records.length, saved);
     return jsonResponse({
       success: true,
       cinema: CINEMA_NAME,
-      screenings_found: result.screenings.length,
+      screenings_found: records.length,
       screenings_saved: saved,
-      events_total: result.eventsCount,
-      cinema_events: result.cinemaEventsCount,
-      instances_fetched: result.instancesFetched,
-      fetch_errors: result.errors.slice(0, 10),
-      import_started_at: startedIso,
+      events_total: allEvents.length,
+      cinema_events_total: cinemaEvents.length,
+      cinema_events_checked: candidates.length,
+      instances_fetched: pairs.length,
+      previous_active: previousActive,
+      import_started_at: startedAt.toISOString(),
       import_completed_at: new Date().toISOString(),
-      examples: records.slice(0, 5).map((r) => ({
-        movie_title: r.movie_title,
-        start_time: r.start_time,
-        source_reference: r.source_reference,
-        booking_url: r.booking_url,
-        format: r.format,
-        sold_out: r.sold_out,
-      })),
+      examples: records.slice(0, 5),
     });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    await endRun(ctx, runId, "failed", 0, 0, msg);
-    return jsonResponse({ success: false, error: msg }, 500);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await endRun(ctx, runId, "failed", 0, 0, message);
+    return jsonResponse({ success: false, error: message }, 500);
   }
 });
+
