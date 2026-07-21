@@ -1,3 +1,16 @@
+// Phoenix Cinema (East Finchley) importer.
+//
+// Source: https://www.phoenixcinema.co.uk/whats-on
+// Provider: Savoy Systems. The whats-on page embeds a JSON blob of the form
+// {"Events":[{...,"Performances":[...]}]} — the same shape used by The Lexi
+// Cinema and Rio Cinema. Each Performance carries an ID (used as the stable
+// performance id), StartDate (YYYY-MM-DD), StartTimeAndNotes (HH:MM),
+// AuditoriumName (Screen 1 / Screen 2), IsSoldOut ("Y"/"N") and a relative
+// booking URL ending in TcsPerformance_{id}.
+//
+// The booking URL is relative to the Phoenix .dll path, so it is prefixed with
+// the Savoy base. Performance ID is the stable source_reference.
+
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2.45.4";
 import {
