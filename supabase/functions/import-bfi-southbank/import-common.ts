@@ -8,23 +8,8 @@ const SOURCE = "https://cinemas.bfi.org.uk";
 const months:Record<string,number>={january:1,february:2,march:3,april:4,may:5,june:6,july:7,august:8,september:9,october:10,november:11,december:12};
 export const cors={"Access-Control-Allow-Origin":"*","Access-Control-Allow-Headers":"authorization, x-client-info, apikey, content-type","Content-Type":"application/json"};
 const reply=(body:unknown,status=200)=>new Response(JSON.stringify(body),{status,headers:cors});
-const decode=(s:string)=>s.replace(/&amp;/g,"&").replace(/&quot;/g,'"').replace(/&#(?:39|039);/g,"'").replace(/&nbsp;/g," ").replace(/&ndash;|&#8211;/g,"â€“").replace(/&mdash;|&#8212;/g,"â€”");
+const decode=(s:string)=>s.replace(/&amp;/g,"&").replace(/&quot;/g,'"').replace(/&#(?:39|039);/g,"'").replace(/&nbsp;/g," ").replace(/&ndash;|&#8211;/g,"–").replace(/&mdash;|&#8212;/g,"—");
 const clean=(s:string)=>decode(s.replace(/<[^>]*>/g," ")).replace(/\s+/g," ").trim();
-
-export function publicBookingUrl(raw:string){
-  const decoded=decode(raw);
-  try{
-    const url=new URL(decoded,SOURCE);
-    if(url.hostname!=="whatson.bfi.org.uk"||!/^\/Online\/login\.asp$/i.test(url.pathname))return url.toString();
-    const target=url.searchParams.get("targetPage");
-    if(!target)return url.toString();
-    const direct=new URL(target,url);
-    if(direct.hostname==="whatson.bfi.org.uk"&&/^\/Online\/(?:map|seat)Select\.asp$/i.test(direct.pathname))return direct.toString();
-    return url.toString();
-  }catch{
-    return decoded;
-  }
-}
 
 function londonIso(y:number,m:number,d:number,h:number,min:number){
   const probe=new Date(Date.UTC(y,m-1,d,h,min));
@@ -87,12 +72,11 @@ export async function fetchBfiRows(venue:Venue,now:Date):Promise<Row[]>{
         if(venue==="imax"&&((link&&!isImax)||(!link&&!/\bIMAX\b/i.test(tagText))))continue;
         if(venue==="southbank"&&((link&&!isSouthbank)||(!link&&/\bIMAX\b/i.test(tagText))))continue;
         const start=parseDateTime(label,now);if(!start||new Date(start)<=now)continue;
-        const booking=link?publicBookingUrl(link[1]):null;
-        const uuid=booking?.match(/performance_ids(?:=|%3D)([0-9a-f-]{36})/i)?.[1]?.toUpperCase();
+        const uuid=link?.[1].match(/performance_ids%3D([0-9a-f-]{36})/i)?.[1]?.toUpperCase();
         const sold=/\bSold out\b/i.test(li);
         const screen=clean(label.match(/(?:Screen\s+(.+)|((?:BFI )?IMAX, Waterloo))$/i)?.[1]||label.match(/(?:Screen\s+(.+)|((?:BFI )?IMAX, Waterloo))$/i)?.[2]||"");
         const fallback=`${title}|${start}|${screen||venue}`.toLowerCase().replace(/[^a-z0-9|:-]+/g,"-");
-        rows.push({cinema_name:cinema,movie_title:title,start_time:start,booking_url:booking,format:formats(`${title} ${tagText}`,venue),sold_out:sold,source_reference:`${prefix}:${uuid||fallback}`,last_seen_at:now.toISOString()});
+        rows.push({cinema_name:cinema,movie_title:title,start_time:start,booking_url:link?decode(link[1]):null,format:formats(`${title} ${tagText}`,venue),sold_out:sold,source_reference:`${prefix}:${uuid||fallback}`,last_seen_at:now.toISOString()});
       }
     }
   }
